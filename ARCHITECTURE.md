@@ -66,6 +66,39 @@ surfaces as a local close event, code 1006 (never sent on the wire).
 Known limitation: no send-side backpressure beyond socket buffers
 (socket.write queues in memory). Fine for 3–10 clients; revisit in §5.
 
+## 2.6 Server relay semantics (Phase 2)
+
+**State held server-side (and nothing more):** per peer — identity
+(clientId/name/color), the connection, last-known cursor {x,y,seq}, last seq,
+lastSeen, a token bucket, drop counters. The server is a presence-holding
+relay, not an authority.
+
+**Relay rules:** each broadcast is serialized ONCE and written to every peer
+except the sender — O(peers) writes, zero self-echo. `cursor` relays carry
+the server receive time (`ts`).
+
+**Ordering (honesty note):** TCP delivers each connection's messages in
+order, so per-sender ordering is preserved end-to-end with no extra
+machinery. The per-client `seq` counter (shared across moves AND reactions)
+is a defensive guard: server and clients drop seq ≤ lastSeq to kill
+duplicates/replays, and it future-proofs an unreliable transport.
+
+**Identity & replacement:** a peer is (clientId, connection). Hello from a
+new connection evicts the old: others see leave("replaced") then join; the
+old socket is closed (1000, "replaced by a newer connection"); a zombie
+close event from the old socket can never evict the newer peer (removal is
+connection-guarded). Duplicate hello on the same connection = idempotent
+snapshot re-request. Rooms are created on demand, GC'd when empty; relays,
+joins, and leaves are strictly room-scoped.
+
+**Heartbeat:** WS-level ping every 10 s (every browser auto-pongs), sweep
+every 5 s, 25 s silence → hard destroy + leave("timeout") (worst case ≈30 s).
+Socket close/error → immediate leave("closed").
+
+**Rate limit:** token bucket per peer on sequenced actions (120 burst /
+120 per second default). Excess dropped silently and counted; hello/ping
+are never limited. Phase 6 adds signaling + escalation.
+
 ## 3. Interpolation strategy — Phase 4
 (buffer keyed on local arrival time; render clock now − 100 ms; lerp;
 decaying extrapolation capped at 100 ms; bounded buffers)
@@ -92,3 +125,9 @@ decaying extrapolation capped at 100 ms; bounded buffers)
 | 10 | Size caps checked at header-parse, before allocation | A 1 GiB declared frame can't OOM the process | Buffer-then-check |
 | 11 | No send backpressure (documented) | Correct + simple at target scale | pause/resume plumbing (premature) |
 | 12 | One frame codec, role-flagged (expectMasked) | Server + Node test client share one RFC implementation | Separate client codec (drift risk) |
+| 13 | Presence + last-known cursor only | Relay-not-authority; minimal honest state | Authoritative world state (unneeded, unverifiable) |
+| 14 | Single shared per-client seq across move+react | One monotonic guard covers everything | Per-type counters (cross-type drops — footgun) |
+| 15 | Peer identity = (clientId, conn), removal connection-guarded | Zombie close events can't evict newer peers | clientId-only identity (replacement race bug) |
+| 16 | Token bucket per peer, silent drop | Protects fan-out from floods; simplest honest policy | Immediate disconnect (harsh), no limit (assignment red flag) |
+| 17 | WS-level pings for liveness | Browsers are silent at app level while idle | App-level pings (idle peers look dead) |
+

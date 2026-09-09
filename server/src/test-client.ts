@@ -1,16 +1,17 @@
 /**
- * test-client.ts — Node-side WebSocket client used by the test suite and,
- * from Phase 2 on, by scripted multi-client scenario harnesses. It exists
- * so every server phase is testable without a browser — and so tests can
- * deliberately violate the protocol via sendRaw().
+ * test-client.ts — Node-side WebSocket client for tests and scripted
+ * multi-client scenarios. Behaves like a well-behaved browser: validates the
+ * 101 handshake, auto-pongs WS pings (disable via { autoPong: false } to
+ * simulate a hung peer), echoes close frames.
  *
- * It shares the frame codec with the server (FrameParser / MessageAssembler
- * with expectMasked flipped) — the exact symmetry RFC 6455 defines:
- *   client → server frames MUST be masked
- *   server → client frames MUST NOT be masked
+ * Phase 2 additions:
+ *   - messages: every successfully parsed inbound ServerMessage, in order
+ *   - invalidMessages: inbound messages our parser REJECTED (must stay 0 —
+ *     a black-box proof that the server only sends protocol-valid frames)
+ *   - clearMessages() for scoped assertions
  *
- * It behaves like a well-behaved browser: auto-pongs pings, echoes close
- * frames, validates the 101 handshake (Sec-WebSocket-Accept).
+ * Shares the frame codec with the server (expectMasked flipped) — the exact
+ * symmetry RFC 6455 defines.
  */
 import * as crypto from "node:crypto";
 import * as http from "node:http";
@@ -26,10 +27,12 @@ import {
   type Assembled,
   type RawFrame,
 } from "./ws.js";
-import { MAX_MESSAGE_BYTES } from "./protocol.js";
+import { parseServerMessage, MAX_MESSAGE_BYTES, type ServerMessage } from "./protocol.js";
 
 export interface TestClientOptions {
   readonly headers?: Record<string, string>;
+  /** Default true. false = never answer WS pings (hung-peer simulation). */
+  readonly autoPong?: boolean;
 }
 
 interface Waiter<T> {
@@ -41,7 +44,13 @@ export class TestClient {
   /** Resolves once the 101 handshake is verified (accept header checked). */
   readonly opened: Promise<void>;
 
+  /** Every successfully parsed inbound server message, in order. */
+  readonly messages: ServerMessage[] = [];
+  /** Inbound messages the parser rejected — should always be 0. */
+  invalidMessages = 0;
+
   private socket: net.Socket | null = null;
+  private readonly autoPong: boolean;
   private readonly parser = new FrameParser({ expectMasked: false, maxFrameBytes: MAX_MESSAGE_BYTES });
   private readonly assembler = new MessageAssembler(MAX_MESSAGE_BYTES);
   private sentClose = false;
@@ -50,10 +59,9 @@ export class TestClient {
   private readonly messageWaiters: Waiter<string>[] = [];
   private readonly closeWaiters: Waiter<{ code: number; reason: string }>[] = [];
   private readonly pongWaiters: Waiter<Buffer>[] = [];
-  private readonly messageQueue: string[] = [];
-  private readonly pongQueue: Buffer[] = [];
 
   constructor(port: number, options: TestClientOptions = {}) {
+    this.autoPong = options.autoPong ?? true;
     const key = crypto.randomBytes(16).toString("base64");
     this.opened = new Promise<void>((resolve, reject) => {
       const req = http.request({
@@ -92,11 +100,13 @@ export class TestClient {
     });
   }
 
+  clearMessages(): void {
+    this.messages.length = 0;
+  }
+
   // -- waits -------------------------------------------------------------------
 
   waitForMessage(timeoutMs = 2000): Promise<string> {
-    const queued = this.messageQueue.shift();
-    if (queued !== undefined) return Promise.resolve(queued);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("timeout: no message")), timeoutMs);
       timer.unref();
@@ -114,8 +124,6 @@ export class TestClient {
   }
 
   waitForPong(timeoutMs = 2000): Promise<Buffer> {
-    const queued = this.pongQueue.shift();
-    if (queued !== undefined) return Promise.resolve(queued);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("timeout: no pong")), timeoutMs);
       timer.unref();
@@ -179,12 +187,16 @@ export class TestClient {
 
   private handle(ev: Assembled): void {
     if (ev.kind === "text") {
+      const parsed = parseServerMessage(ev.text);
+      if (parsed.ok) {
+        this.messages.push(parsed.message);
+      } else {
+        this.invalidMessages++;
+      }
       const w = this.messageWaiters.shift();
       if (w) {
         clearTimeout(w.timer);
         w.resolve(ev.text);
-      } else {
-        this.messageQueue.push(ev.text);
       }
       return;
     }
@@ -216,15 +228,15 @@ export class TestClient {
       this.socket?.end();
       setTimeout(() => this.socket?.destroy(), 500).unref();
     } else if (opcode === Opcode.Ping) {
-      this.sendRaw(encodeFrame({ opcode: Opcode.Pong, payload, mask: crypto.randomBytes(4) }));
+      if (this.autoPong) {
+        this.sendRaw(encodeFrame({ opcode: Opcode.Pong, payload, mask: crypto.randomBytes(4) }));
+      }
     } else {
       // pong from server
       const w = this.pongWaiters.shift();
       if (w) {
         clearTimeout(w.timer);
         w.resolve(payload);
-      } else {
-        this.pongQueue.push(payload);
       }
     }
   }

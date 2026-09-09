@@ -342,9 +342,11 @@ describe("integration over loopback TCP", () => {
       encodeFrame({ opcode: Opcode.Continuation, payload: Buffer.from("world"), fin: true, mask }),
     );
     // The ping is answered mid-message; the assembled message still arrives whole.
-    const pong = await client.waitForPong();
+    const pongPromise = client.waitForPong();
+    const msgPromise = client.waitForMessage();
+    const pong = await pongPromise;
     expect(pong.toString()).toBe("hb");
-    expect(await client.waitForMessage()).toBe("hello world");
+    expect(await msgPromise).toBe("hello world");
   });
 
   it("auto-pongs server-initiated pings (payload echoed)", async () => {

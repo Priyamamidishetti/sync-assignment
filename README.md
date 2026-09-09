@@ -5,17 +5,15 @@ No Socket.IO / Yjs / PartyKit / any sync library.
 
 ## Status
 - ✅ Phase 0: wire protocol + validators
-- ✅ Phase 1: hand-rolled RFC 6455 WebSocket server (handshake, frame codec,
-      fragmentation, ping/pong, close handshake, pre-allocation size caps)
-- ⏳ Phase 2: rooms, presence, relay — next
+- ✅ Phase 1: hand-rolled RFC 6455 WebSocket server
+- ✅ Phase 2: rooms, presence, relay, heartbeat, replace-on-reconnect
+- ⏳ Phase 3: browser client — next
 
-## Phase 1 transport rig (temporary — replaced by the real server in Phase 2)
-    cd server && npm run dev:echo
-Browser devtools console (any page):
-    const ws = new WebSocket("ws://localhost:8080/");
-    ws.onmessage = (e) => console.log("echo:", e.data);
-    ws.onclose  = (e) => console.log("closed:", e.code, e.reason);
-    ws.send("hello");   // → echo: hello
+## Run the server
+    cd server && npm run dev
+    # WebSocket: any path on ws://localhost:8080/ · health: http://localhost:8080/healthz
+(No browser client yet — Phase 3. `npm run dev:echo` still runs the Phase 1 echo rig
+as a transport debug tool.)
 
 ## Setup (current state)
 Server tests:

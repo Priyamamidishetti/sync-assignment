@@ -5,6 +5,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
+    "dev": "tsx src/server.ts",
     "dev:echo": "tsx src/echo.ts",
     "test": "vitest run",
     "test:watch": "vitest",
