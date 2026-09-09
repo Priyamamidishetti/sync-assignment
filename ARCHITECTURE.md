@@ -99,7 +99,7 @@ Socket close/error → immediate leave("closed").
 120 per second default). Excess dropped silently and counted; hello/ping
 are never limited. Phase 6 adds signaling + escalation.
 
-## 3. Client sync core (Phase 3) & interpolation (Phase 4 — pending)
+## 3. Client sync core (Phase 3) & interpolation engine (Phase 4)
 
 ### 3.1 Layering
     App.tsx (React UI, no sockets)
@@ -113,7 +113,44 @@ are never limited. Phase 6 adds signaling + escalation.
 an instant first sample; a single trailing flush guarantees the final
 resting position reaches the wire. Dev mode logs the measured rate.
 
-### 3.3 Identity & seq epochs
+### 3.3 Interpolation strategy (Phase 4)
+
+    inbound cursor ──► sample {x, y, seq, at: LOCAL arrival time}
+                          │  burst stretching: bunched samples spaced ≥ 8 ms
+                          ▼
+                 bounded buffer (≤ 16 samples, ≤ ~1 s)          ← per peer
+                          │
+    rAF: t = now − 100 ms ─┤
+                          ├─ t inside history ──► lerp between bracketing samples
+                          ├─ t past newest ──► dead reckoning; velocity decays
+                          │                     linearly to 0 over 100 ms → full
+                          │                     stop → hold (overshoot ≤ v·cap/2)
+                          └─ data resumes ────► recovery blend eases the rendered
+                                                position onto the true path (150 ms)
+
+Why arrival time, not synchronized clocks: samples are stamped with local
+performance.now() on arrival and the render clock lags "now" by a fixed
+delay — peer clock skew becomes a constant offset absorbed by the delay.
+No NTP, no server timestamps in the math (server `ts` is diagnostics only).
+
+Tradeoff: the 100 ms delay is a constant 100 ms of added visual latency on
+top of network RTT, in exchange for rendering from history (which always
+exists) instead of from the newest jittery sample. At 30 Hz sender spacing,
+the delay holds ≈ 3 samples of runway; extrapolation covers a further
+100 ms of silence; beyond that we deliberately freeze rather than guess.
+The recovery blend bounds the visual cost of a wrong prediction: any
+correction unwinds over 150 ms instead of snapping.
+
+Failure behavior: burst arrival → stretched replay, not a teleport · long
+stall → eased stop then hold · resume → smooth correction · pathological
+velocity → clamped to 3 units/s and positions clamped to [0,1] · memory →
+≤ 16 samples + ≤ 64 feed timestamps per peer, pruned on every feed.
+
+Config (all tunable; `?snap=1` = delay 0 / cap 0 / recovery 0 for A/B):
+delay 100 · cap 100 · recovery 150 · maxSamples 16 · window 1 s ·
+minSpacing 8 · minVelocityDt 24 · maxVelocity 3/s.
+
+### 3.4 Identity & seq epochs
 clientId persists in localStorage. ONE seq counter (move+react) never
 resets while the page lives. Receivers recreate peer entries on
 join/leave — "identity epochs" — resetting per-peer seq baselines, so a
@@ -121,16 +158,15 @@ reloaded sender can never be frozen by a stale receiver baseline. The
 epoch reset is the load-bearing mechanism; the never-reset counter covers
 any missed flapping.
 
-### 3.4 Disconnect detection & reconnect
+### 3.5 Disconnect detection & reconnect
 onclose + watchdog: app-level ping every 5 s; 3 consecutive silent pings
 while the tab is visible ⇒ half-open socket ⇒ force-close. (Browsers can
 take minutes to notice dead TCP; server WS-pings are invisible to JS.)
 Backoff 500 ms ×2 → 8 s cap, ±30 % jitter, unlimited attempts, reset on
 welcome. On rejoin, one unthrottled move restores our cursor for others.
 
-### 3.5 Known debt (by design, per phase plan)
-Snapping remote cursors (→ Phase 4, via the peerPosition seam), reaction
-rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (→ 6).
+### 3.6 Known debt (by design, per phase plan)
+Reaction rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (→ 6).
 
 ## 4. Failure handling matrix — Phase 6
 (disconnect, reconnect, out-of-order, malformed, oversized, flood)
@@ -164,4 +200,9 @@ rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (→ 6).
 | 20 | Client watchdog (3 unanswered app-pings, visible-only) | onclose alone leaves a zombie "online" state for minutes | Trust onclose only |
 | 21 | Leading+trailing throttle, latest-value pending | ≤30 Hz AND guaranteed final position | Timer sampling (loses resting position) |
 | 22 | Hand-rolled static serving, same origin | Single-port demo, no express | express (dependency for ~40 lines) |
+| 23 | Arrival-time buffering, no clock sync | Skew becomes a constant absorbed by the delay | Server timestamps + offset estimation (machinery, no visual gain) |
+| 24 | Burst stretching (≥ 8 ms virtual spacing) | Slow-3G batches would collapse into one frame | Accept the teleport (assignment red flag) |
+| 25 | Linear-decay dead reckoning to a full stop | Bounded overshoot (v·cap/2); velocity is exactly 0 at the cap — no jerk at the hold seam | Pure linear extrapolation (unbounded error); exponential decay (harder to test/explain) |
+| 26 | Recovery blend (150 ms) at resume | Prediction error unwinds smoothly instead of snapping back | Snap to truth (visible blip) |
+| 27 | Filter state separated from pure track math | One render consumer; debug polling can't corrupt the blend | Stateful track (polling hazards) |
 

@@ -1,8 +1,9 @@
 /**
  * connection.ts — the client sync engine: native WebSocket transport,
- * identity, throttling, reconnect, inbound validation, and the peer store.
- * Framework-agnostic: React never touches a socket; the renderer reads
- * state only through the public API below.
+ * identity, throttling, reconnect, inbound validation, peer store, and
+ * (Phase 4) the interpolation engine wired in behind the peerPosition()
+ * seam. Framework-agnostic: React never touches a socket; the renderer
+ * reads state only through the public API below.
  *
  *  - Own cursor: local prediction, zero added latency (FR-29).
  *  - Moves: ≤30 Hz, leading + trailing, trailing guaranteed (FR-13).
@@ -12,14 +13,15 @@
  *    (counter back at 0) can never be wedge-frozen by a stale baseline.
  *  - Disconnect detection: onclose/onerror PLUS an app-level watchdog —
  *    we ping every 5 s; 3 consecutive pings with zero inbound traffic while
- *    visible ⇒ half-open socket ⇒ force-close ⇒ reconnect. (Browsers can
- *    take minutes to notice a dead TCP path on their own, and the server's
- *    WS-level pings are invisible to page JS.)
+ *    visible ⇒ half-open socket ⇒ force-close ⇒ reconnect.
  *  - Reconnect: exponential backoff 500ms → ×2 → 8 s cap, ±30 % jitter,
  *    unlimited attempts, reset on welcome. Same persisted clientId ⇒ the
  *    server evicts our old connection (FR-6) ⇒ exactly one cursor.
  *  - Inbound: everything goes through parseServerMessage; malformed input
  *    is counted and dropped, never crashes (FR-32).
+ *  - PHASE 4: remote positions come from the InterpolationEngine; the
+ *    welcome snapshot seeds it; join/leave reset its tracks (identity
+ *    epochs apply to interpolation state too).
  */
 import {
   encodeMessage,
@@ -33,6 +35,7 @@ import {
 } from "@protocol";
 import { LeadingTrailingThrottle } from "./throttle";
 import { backoffDelay } from "./backoff";
+import { InterpolationEngine, type InterpolationConfig } from "./interpolation"; // PHASE 4
 
 export type ConnectionState = "connecting" | "online" | "reconnecting";
 
@@ -40,7 +43,6 @@ export interface RemoteCursor {
   readonly x: number;
   readonly y: number;
   readonly seq: number;
-  /** performance.now() when this update ARRIVED locally (Phase 4 key). */
   readonly at: number;
 }
 
@@ -59,20 +61,28 @@ export type RoomEvent =
   | { type: "server-error"; code: ErrorCode; detail: string }
   | { type: "stats"; rttMs: number };
 
+export interface InterpDebugEntry {
+  readonly clientId: string;
+  readonly name: string;
+  readonly mode: string;
+  readonly depth: number;
+  readonly beyondMs: number;
+  readonly ratePerSec: number;
+}
+
 export interface RoomSessionOptions {
   readonly url: string;
   readonly roomId: string;
   readonly clientId: string;
   readonly name?: string;
-  readonly moveHz?: number; // default 30
-  readonly pingIntervalMs?: number; // default 5000
-  /** Dev: log the measured move send rate every 5 s. */
+  readonly moveHz?: number;
+  readonly pingIntervalMs?: number;
   readonly debugRateLog?: boolean;
+  /** PHASE 4: interpolation overrides (e.g. ?snap=1 → all-zero = snapping). */
+  readonly interpolation?: Partial<InterpolationConfig>;
   readonly onEvent: (event: RoomEvent) => void;
 }
 
-/** Same-origin WebSocket URL — works behind Vite's dev proxy and the
- *  single-port static build alike. */
 export function defaultWsUrl(): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}/ws`;
@@ -82,6 +92,7 @@ export class RoomSession {
   private readonly moveThrottle: LeadingTrailingThrottle<{ x: number; y: number }>;
   private readonly moveHz: number;
   private readonly pingIntervalMs: number;
+  private readonly interp: InterpolationEngine; // PHASE 4
 
   private ws: WebSocket | null = null;
   private stopped = false;
@@ -99,12 +110,12 @@ export class RoomSession {
   private devTimer: ReturnType<typeof setInterval> | null = null;
   private movesSentWindow = 0;
 
-  /** Counted, never fatal: inbound messages the protocol parser rejected. */
   invalidServerMessages = 0;
 
   constructor(private readonly opts: RoomSessionOptions) {
     this.moveHz = opts.moveHz ?? 30;
     this.pingIntervalMs = opts.pingIntervalMs ?? 5_000;
+    this.interp = new InterpolationEngine(opts.interpolation); // PHASE 4
     this.moveThrottle = new LeadingTrailingThrottle<{ x: number; y: number }>(
       1000 / this.moveHz,
       (v) => {
@@ -145,13 +156,27 @@ export class RoomSession {
   }
 
   /**
-   * THE RENDERING SEAM. Phase 3: last-known position (snapping — known
-   * debt, by design). Phase 4: this becomes the interpolator's output.
-   * The renderer depends only on this method, so Phase 4 changes nothing
-   * in render.ts.
+   * THE RENDERING SEAM. Phase 4: the interpolation engine's filtered output
+   * at (now − renderDelay). render.ts still calls exactly this method —
+   * it was never changed when the engine landed.
    */
   peerPosition(peer: RemotePeer): { x: number; y: number } | null {
-    return peer.cursor !== null ? { x: peer.cursor.x, y: peer.cursor.y } : null;
+    return this.interp.positionNow(peer.clientId);
+  }
+
+  /** PHASE 4: raw per-peer interpolation state for the dev panel. */
+  interpolationDebug(): InterpDebugEntry[] {
+    return this.interp.debugSnapshot().map((entry) => {
+      const peer = this.peers.get(entry.peerId);
+      return {
+        clientId: entry.peerId,
+        name: peer?.name ?? entry.peerId,
+        mode: entry.mode,
+        depth: entry.depth,
+        beyondMs: entry.beyondMs,
+        ratePerSec: entry.ratePerSec,
+      };
+    });
   }
 
   // -- outbound -------------------------------------------------------------------
@@ -162,7 +187,6 @@ export class RoomSession {
   }
 
   sendReact(x: number, y: number, emoji: ReactionEmoji): void {
-    // Discrete and human-rate-bounded → immediate, no throttle.
     this.rawSend({ t: "react", x, y, emoji, seq: this.nextSeq() });
   }
 
@@ -179,7 +203,7 @@ export class RoomSession {
       this.devTimer = null;
     }
     if (this.ws !== null) {
-      this.ws.onclose = null; // deliberate close — don't treat as a drop
+      this.ws.onclose = null;
       this.ws.close();
       this.ws = null;
     }
@@ -198,7 +222,6 @@ export class RoomSession {
     this.ws = ws;
 
     ws.onopen = () => {
-      // Protocol handshake: hello now; "online" only after welcome.
       this.rawSend({
         t: "hello",
         v: PROTOCOL_VERSION,
@@ -251,9 +274,10 @@ export class RoomSession {
     switch (msg.t) {
       case "welcome": {
         this.youInfo = msg.you;
-        // The snapshot is authoritative: rebuild the whole peer map. This
-        // is also an identity-epoch reset for OUR view of every peer.
+        // Snapshot is authoritative: rebuild the peer map AND the
+        // interpolation state (identity-epoch reset for our whole view).
         this.peers.clear();
+        this.interp.clear(); // PHASE 4
         const now = performance.now();
         for (const snap of msg.peers) {
           this.peers.set(snap.clientId, {
@@ -265,8 +289,11 @@ export class RoomSession {
                 ? { x: snap.x, y: snap.y, seq: snap.seq, at: now }
                 : null,
           });
+          if (snap.x !== undefined && snap.y !== undefined && snap.seq !== undefined) {
+            this.interp.feed(snap.clientId, snap.x, snap.y, snap.seq, now); // PHASE 4: seed
+          }
         }
-        this.attempt = 0; // success — backoff resets
+        this.attempt = 0;
         this.unansweredPings = 0;
         this.setState("online");
         this.startPingLoop();
@@ -286,19 +313,21 @@ export class RoomSession {
       }
       case "join": {
         if (msg.clientId === this.opts.clientId) return; // defensive: never happens
-        // Fresh entry = identity epoch for this peer (resets its seq baseline;
-        // also makes rapid leave→join flapping idempotent, FR-6 tolerance).
         this.peers.set(msg.clientId, {
           clientId: msg.clientId,
           name: msg.name,
           color: msg.color,
           cursor: null,
         });
+        this.interp.remove(msg.clientId); // PHASE 4: fresh track = fresh epoch
         this.emit({ type: "peers" });
         return;
       }
       case "leave": {
-        if (this.peers.delete(msg.clientId)) this.emit({ type: "peers" });
+        if (this.peers.delete(msg.clientId)) {
+          this.interp.remove(msg.clientId); // PHASE 4
+          this.emit({ type: "peers" });
+        }
         return;
       }
       case "cursor": {
@@ -306,11 +335,11 @@ export class RoomSession {
         if (peer === undefined) return; // unknown peer (race) — ignore
         if (peer.cursor !== null && msg.seq <= peer.cursor.seq) return; // stale/dup, FR-14
         peer.cursor = { x: msg.x, y: msg.y, seq: msg.seq, at: performance.now() };
+        this.interp.feed(msg.from, msg.x, msg.y, msg.seq, performance.now()); // PHASE 4
         this.emit({ type: "peers" });
         return;
       }
       case "reaction": {
-        // Emitted now; burst rendering lands in Phase 5.
         this.emit({ type: "reaction", from: msg.from, x: msg.x, y: msg.y, emoji: msg.emoji, seq: msg.seq });
         return;
       }
@@ -345,8 +374,6 @@ export class RoomSession {
     if (this.stopped || this.ws === null || this.ws.readyState !== WebSocket.OPEN) return;
     if (document.hidden) return; // timers are throttled; server liveness rides on WS pings anyway
     this.rawSend({ t: "ping", clientTime: performance.now() });
-    // Watchdog: 3 consecutive pings with no inbound at all in between, while
-    // visible ⇒ half-open connection. Force-close; onclose drives reconnect.
     const silence = performance.now() - this.lastInboundAt;
     this.unansweredPings = silence > this.pingIntervalMs ? this.unansweredPings + 1 : 0;
     if (this.unansweredPings >= 3) {
@@ -369,7 +396,6 @@ export class RoomSession {
   }
 
   private nextSeq(): number {
-    // ONE counter for moves AND reactions. Never reset while the page lives.
     return (this.seqCounter += 1);
   }
 
