@@ -99,9 +99,38 @@ Socket close/error → immediate leave("closed").
 120 per second default). Excess dropped silently and counted; hello/ping
 are never limited. Phase 6 adds signaling + escalation.
 
-## 3. Interpolation strategy — Phase 4
-(buffer keyed on local arrival time; render clock now − 100 ms; lerp;
-decaying extrapolation capped at 100 ms; bounded buffers)
+## 3. Client sync core (Phase 3) & interpolation (Phase 4 — pending)
+
+### 3.1 Layering
+    App.tsx (React UI, no sockets)
+      └─ RoomSession (connection.ts): transport, throttle, reconnect,
+         peer store, seq dedupe — framework-agnostic
+           └─ CursorCanvas (render.ts): input capture + drawing;
+              reads positions ONLY via session.peerPosition()
+
+### 3.2 Move throttling
+≤30 Hz leading+trailing on a latest-value stream: leading gives receivers
+an instant first sample; a single trailing flush guarantees the final
+resting position reaches the wire. Dev mode logs the measured rate.
+
+### 3.3 Identity & seq epochs
+clientId persists in localStorage. ONE seq counter (move+react) never
+resets while the page lives. Receivers recreate peer entries on
+join/leave — "identity epochs" — resetting per-peer seq baselines, so a
+reloaded sender can never be frozen by a stale receiver baseline. The
+epoch reset is the load-bearing mechanism; the never-reset counter covers
+any missed flapping.
+
+### 3.4 Disconnect detection & reconnect
+onclose + watchdog: app-level ping every 5 s; 3 consecutive silent pings
+while the tab is visible ⇒ half-open socket ⇒ force-close. (Browsers can
+take minutes to notice dead TCP; server WS-pings are invisible to JS.)
+Backoff 500 ms ×2 → 8 s cap, ±30 % jitter, unlimited attempts, reset on
+welcome. On rejoin, one unthrottled move restores our cursor for others.
+
+### 3.5 Known debt (by design, per phase plan)
+Snapping remote cursors (→ Phase 4, via the peerPosition seam), reaction
+rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (→ 6).
 
 ## 4. Failure handling matrix — Phase 6
 (disconnect, reconnect, out-of-order, malformed, oversized, flood)
@@ -130,4 +159,9 @@ decaying extrapolation capped at 100 ms; bounded buffers)
 | 15 | Peer identity = (clientId, conn), removal connection-guarded | Zombie close events can't evict newer peers | clientId-only identity (replacement race bug) |
 | 16 | Token bucket per peer, silent drop | Protects fan-out from floods; simplest honest policy | Immediate disconnect (harsh), no limit (assignment red flag) |
 | 17 | WS-level pings for liveness | Browsers are silent at app level while idle | App-level pings (idle peers look dead) |
+| 18 | peerPosition() seam between session and renderer | Phase 4 adds interpolation with zero renderer changes | Renderer reads cursors directly |
+| 19 | Seq baselines reset via identity epochs + counter never resets in-page | Reload/reconnect can't wedge a sender | Persisted global counter (state, races) |
+| 20 | Client watchdog (3 unanswered app-pings, visible-only) | onclose alone leaves a zombie "online" state for minutes | Trust onclose only |
+| 21 | Leading+trailing throttle, latest-value pending | ≤30 Hz AND guaranteed final position | Timer sampling (loses resting position) |
+| 22 | Hand-rolled static serving, same origin | Single-port demo, no express | express (dependency for ~40 lines) |
 

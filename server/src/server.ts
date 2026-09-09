@@ -1,22 +1,38 @@
 /**
- * server.ts — http server: upgrade routing → RoomManager, /healthz.
- * Static file serving for the client demo lands in Phase 3.
+ * server.ts — http server: upgrade routing → RoomManager, /healthz, and
+ * static serving of the built client (../client/dist) so the demo runs
+ * single-origin on one port. Hand-rolled static serving (no express):
+ * path-traversal-guarded, hashed assets get immutable caching, index.html
+ * is no-cache.
  *
  *   npm run dev   →   http://localhost:8080/  (WebSocket on any path)
  *
- * Per-connection wiring lives here (parse → route); room semantics live in
- * room.ts. Layering: transport (ws) → protocol (parse/validate) → rooms
- * (presence/relay) — adding a new action type touches route() + room.ts +
- * protocol.ts, never the transport.
+ * Dev flow alternative: `cd client && npm run dev` (Vite on :5173,
+ * proxying /ws here).
  */
+import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
-import { pathToFileURL } from "node:url";
+import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { acceptWebSocket, type WsConnection } from "./ws.js";
 import { encodeMessage, parseClientMessage, type ClientMessage, type ErrorCode } from "./protocol.js";
 import { RoomManager, type RoomManagerOptions } from "./room.js";
 
 const PORT = Number(process.env.PORT ?? 8080);
+const CLIENT_DIST = fileURLToPath(new URL("../../client/dist", import.meta.url));
+
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".map": "application/json",
+  ".woff2": "font/woff2",
+};
 
 export function createLiveRoomServer(options: RoomManagerOptions = {}) {
   const manager = new RoomManager(options);
@@ -27,8 +43,7 @@ export function createLiveRoomServer(options: RoomManagerOptions = {}) {
       res.end(JSON.stringify({ ok: true, ...manager.stats() }));
       return;
     }
-    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-    res.end("live-room server — connect a WebSocket to this origin (any path).\n");
+    void serveStatic(req, res);
   });
 
   httpServer.on("upgrade", (req, socket, head) => {
@@ -41,13 +56,56 @@ export function createLiveRoomServer(options: RoomManagerOptions = {}) {
   return { httpServer, manager };
 }
 
+// -- static serving ---------------------------------------------------------------
+
+async function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(new URL(req.url ?? "/", "http://localhost").pathname);
+  } catch {
+    res.writeHead(400);
+    res.end("bad path");
+    return;
+  }
+  if (pathname === "/") pathname = "/index.html";
+
+  const root = path.normalize(CLIENT_DIST);
+  const filePath = path.normalize(path.join(root, pathname));
+  if (!filePath.startsWith(root + path.sep)) {
+    res.writeHead(404);
+    res.end("not found");
+    return;
+  }
+
+  let body: Buffer;
+  try {
+    body = await fs.promises.readFile(filePath);
+  } catch {
+    if (pathname === "/index.html") {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("client bundle not found — build it: cd client && npm run build\n");
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+    return;
+  }
+
+  res.writeHead(200, {
+    "content-type": MIME[path.extname(filePath).toLowerCase()] ?? "application/octet-stream",
+    // Vite hashes asset filenames → immutable; the document stays fresh.
+    "cache-control": pathname.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache",
+  });
+  res.end(body);
+}
+
+// -- per-connection wiring -----------------------------------------------------------
+
 function wire(manager: RoomManager, conn: WsConnection): void {
   conn.on("message", (text: string) => {
     const parsed = parseClientMessage(text);
     if (!parsed.ok) {
-      // FR-32: malformed → error reply, connection survives…
       sendError(conn, parsed.code, parsed.detail);
-      // …except a version mismatch, which cannot proceed.
       if (parsed.code === "bad_version") conn.close(1002, "unsupported protocol version");
       return;
     }
@@ -70,12 +128,9 @@ function route(manager: RoomManager, conn: WsConnection, msg: ClientMessage): vo
       if (result === "not_joined") {
         sendError(conn, "not_joined", `${msg.t} sent before hello`);
       }
-      // "stale" | "rate_limited" | "relayed" → silent by design.
-      // Phase 6 adds error signaling + repeated-violation escalation.
       return;
     }
     case "ping": {
-      // App-level RTT probe — answered regardless of join state.
       conn.send(encodeMessage({ t: "pong", clientTime: msg.clientTime, serverTime: Date.now() }));
       return;
     }
@@ -86,13 +141,12 @@ function sendError(conn: WsConnection, code: ErrorCode, detail: string): void {
   conn.send(encodeMessage({ t: "error", code, detail: clampDetail(detail) }));
 }
 
-/** Code-point-safe 200-char cap so our own error messages always validate. */
 function clampDetail(s: string): string {
   const cps = [...s];
   return cps.length <= 200 ? s : cps.slice(0, 200).join("");
 }
 
-// -- entrypoint --------------------------------------------------------------------
+// -- entrypoint -------------------------------------------------------------------------
 
 function main() {
   const { httpServer, manager } = createLiveRoomServer();
