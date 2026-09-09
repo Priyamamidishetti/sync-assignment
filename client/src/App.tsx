@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PEER_COLORS, REACTION_EMOJIS, type PeerInfo, type ReactionEmoji } from "@protocol";
 import { CursorCanvas } from "./render";
 import {
+  peerOpacity,
   RoomSession,
   defaultWsUrl,
   type ConnectionState,
@@ -232,12 +233,33 @@ export default function App() {
           <span style={{ width: 10, height: 10, borderRadius: 999, display: "inline-block", background: ui.you ? PEER_COLORS[ui.you.color] : "#888" }} />
           <span>{ui.you ? `${ui.you.name} (you)` : "you"}</span>
         </div>
-        {ui.peers.map((p) => (
-          <div key={p.clientId} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
-            <span style={{ width: 10, height: 10, borderRadius: 999, display: "inline-block", background: PEER_COLORS[p.color] ?? "#888" }} />
-            <span>{p.name}</span>
-          </div>
-        ))}
+        {ui.peers.map((p) => {
+          const opacity = peerOpacity(p);
+          return (
+            <div
+              key={p.clientId}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "3px 0",
+                opacity: Math.max(0.25, opacity),
+                transition: "opacity 0.3s ease",
+              }}
+            >
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 999,
+                  display: "inline-block",
+                  background: PEER_COLORS[p.color] ?? "#888",
+                }}
+              />
+              <span>{p.name}{opacity < 1 ? " (idle)" : ""}</span>
+            </div>
+          );
+        })}
       </aside>
 
       {/* Emoji picker: DOM above the canvas — its clicks never spawn reactions. */}

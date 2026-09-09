@@ -15,7 +15,7 @@
  * (header, emoji picker, presence) never spawn reactions.
  */
 import { PEER_COLORS, type ReactionEmoji } from "@protocol";
-import type { RemotePeer, RoomSession } from "./connection";
+import { peerOpacity, type RemotePeer, type RoomSession } from "./connection";
 import { ReactionBursts } from "./bursts";
 
 const FALLBACK_COLOR = "#5b8ee6";
@@ -99,10 +99,13 @@ export class CursorCanvas {
     const h = window.innerHeight;
     this.ctx.clearRect(0, 0, w, h);
 
+    const now = performance.now();
     for (const peer of this.session.peerList()) {
+      const opacity = peerOpacity(peer, now);
+      if (opacity <= 0) continue; // fully faded (PHASE 6 / FR-11)
       const pos = this.session.peerPosition(peer); // the seam — unchanged
       if (pos === null) continue; // joined but never moved
-      this.drawCursor(pos.x * w, pos.y * h, PEER_COLORS[peer.color] ?? FALLBACK_COLOR, peer.name);
+      this.drawCursor(pos.x * w, pos.y * h, PEER_COLORS[peer.color] ?? FALLBACK_COLOR, peer.name, opacity);
     }
 
     if (this.ownVisible) {
@@ -116,9 +119,10 @@ export class CursorCanvas {
     this.bursts.draw(this.ctx, w, h, performance.now());
   }
 
-  private drawCursor(x: number, y: number, color: string, label: string): void {
+  private drawCursor(x: number, y: number, color: string, label: string, opacity = 1): void {
     const ctx = this.ctx;
     ctx.save();
+    ctx.globalAlpha = opacity;
     ctx.translate(x, y);
 
     // pointer arrow

@@ -57,6 +57,19 @@ export interface RemotePeer {
   cursor: RemoteCursor | null;
   /** PHASE 5: shared seq baseline for ALL inbound actions (move + react). */
   lastSeq: number;
+  /** PHASE 6 (FR-11): timestamp of last inbound activity for stale fade/prune. */
+  lastSeenAt: number;
+}
+
+/**
+ * PHASE 6 (FR-11): Opacity based on peer inactivity.
+ * Full opacity under 10s, linear decay to 0 between 10s and 15s.
+ */
+export function peerOpacity(peer: RemotePeer, now: number = performance.now()): number {
+  const age = now - peer.lastSeenAt;
+  if (age < 10_000) return 1;
+  if (age >= 15_000) return 0;
+  return 1 - (age - 10_000) / 5_000;
 }
 
 export type RoomEvent =
@@ -113,6 +126,7 @@ export class RoomSession {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private devTimer: ReturnType<typeof setInterval> | null = null;
+  private staleTimer: ReturnType<typeof setInterval> | null = null; // PHASE 6
   private movesSentWindow = 0;
 
   invalidServerMessages = 0;
@@ -135,6 +149,7 @@ export class RoomSession {
     if (this.ws !== null || this.reconnectTimer !== null) return;
     this.setState("connecting");
     if (this.opts.debugRateLog === true) this.startRateLog();
+    this.startStaleSweep(); // PHASE 6
     this.connect();
   }
 
@@ -199,6 +214,7 @@ export class RoomSession {
     this.stopped = true;
     this.moveThrottle.cancel();
     this.stopPingLoop();
+    this.stopStaleSweep(); // PHASE 6
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -295,6 +311,7 @@ export class RoomSession {
               ? { x: snap.x as number, y: snap.y as number, seq: snap.seq as number, at: now }
               : null,
             lastSeq: hasCursor ? (snap.seq as number) : -1, // PHASE 5
+            lastSeenAt: now, // PHASE 6 (FR-11)
           });
           if (hasCursor) {
             this.interp.feed(
@@ -332,6 +349,7 @@ export class RoomSession {
           color: msg.color,
           cursor: null,
           lastSeq: -1, // PHASE 5: fresh entry = fresh baseline (identity epoch)
+          lastSeenAt: performance.now(), // PHASE 6 (FR-11)
         });
         this.interp.remove(msg.clientId);
         this.emit({ type: "peers" });
@@ -349,6 +367,7 @@ export class RoomSession {
         if (peer === undefined) return; // unknown peer (race) — ignore
         if (msg.seq <= peer.lastSeq) return; // stale/dup — SHARED baseline (FR-14)
         peer.lastSeq = msg.seq; // PHASE 5
+        peer.lastSeenAt = performance.now(); // PHASE 6 (FR-11)
         peer.cursor = { x: msg.x, y: msg.y, seq: msg.seq, at: performance.now() };
         this.interp.feed(msg.from, msg.x, msg.y, msg.seq, performance.now());
         this.emit({ type: "peers" });
@@ -361,6 +380,7 @@ export class RoomSession {
         if (peer === undefined) return; // unknown peer — ignore
         if (msg.seq <= peer.lastSeq) return; // stale/dup (FR-20)
         peer.lastSeq = msg.seq; // reactions advance the shared baseline too
+        peer.lastSeenAt = performance.now(); // PHASE 6 (FR-11)
         this.emit({ type: "reaction", from: msg.from, x: msg.x, y: msg.y, emoji: msg.emoji, seq: msg.seq });
         return;
       }
@@ -401,6 +421,35 @@ export class RoomSession {
       console.warn("[live-room] watchdog: no inbound for ~3 ping intervals — forcing reconnect");
       this.ws.close();
     }
+  }
+
+  // -- stale-peer sweep (Phase 6 / FR-11) -----------------------------------------------------
+
+  private startStaleSweep(): void {
+    this.stopStaleSweep();
+    this.staleTimer = setInterval(() => this.sweepStalePeers(), 1_000);
+  }
+
+  private stopStaleSweep(): void {
+    if (this.staleTimer !== null) {
+      clearInterval(this.staleTimer);
+      this.staleTimer = null;
+    }
+  }
+
+  sweepStalePeers(now: number = performance.now()): boolean {
+    let changed = false;
+    for (const [id, peer] of this.peers) {
+      if (now - peer.lastSeenAt >= 15_000) {
+        this.peers.delete(id);
+        this.interp.remove(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.emit({ type: "peers" });
+    }
+    return changed;
   }
 
   // -- misc ------------------------------------------------------------------------------------

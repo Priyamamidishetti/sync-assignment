@@ -102,11 +102,26 @@ async function serveStatic(req: http.IncomingMessage, res: http.ServerResponse):
 // -- per-connection wiring -----------------------------------------------------------
 
 function wire(manager: RoomManager, conn: WsConnection): void {
+  let malformedCount = 0;
+  let malformedWindowStart = Date.now();
+
   conn.on("message", (text: string) => {
     const parsed = parseClientMessage(text);
     if (!parsed.ok) {
       sendError(conn, parsed.code, parsed.detail);
-      if (parsed.code === "bad_version") conn.close(1002, "unsupported protocol version");
+      if (parsed.code === "bad_version") {
+        conn.close(1002, "unsupported protocol version");
+        return;
+      }
+      const now = Date.now();
+      if (now - malformedWindowStart > 10_000) {
+        malformedCount = 0;
+        malformedWindowStart = now;
+      }
+      malformedCount += 1;
+      if (malformedCount >= 5) {
+        conn.close(1008, "repeated malformed messages (5 in 10s)");
+      }
       return;
     }
     route(manager, conn, parsed.message);

@@ -414,4 +414,15 @@ describe("rooms, presence & relay", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, rooms: 2, peers: 3 });
   });
+
+  it("repeated malformed escalation: 5 violations in 10s triggers 1008 disconnect", async () => {
+    const c = await connect();
+    const closePromise = c.waitForClose(2000);
+    for (let i = 0; i < 5; i++) {
+      c.send("not valid json at all");
+    }
+    const close = await closePromise;
+    expect(close.code).toBe(1008);
+    expect(close.reason).toContain("repeated malformed");
+  });
 });
