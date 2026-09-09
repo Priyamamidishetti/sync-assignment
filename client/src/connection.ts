@@ -77,6 +77,7 @@ export type RoomEvent =
   | { type: "ready"; you: PeerInfo }
   | { type: "peers" }
   | { type: "reaction"; from: string; x: number; y: number; emoji: ReactionEmoji; seq: number }
+  | { type: "chat"; from: string; name: string; color: number; text: string; ts: number; seq: number }
   | { type: "server-error"; code: ErrorCode; detail: string }
   | { type: "stats"; rttMs: number };
 
@@ -208,6 +209,12 @@ export class RoomSession {
   sendReact(x: number, y: number, emoji: ReactionEmoji): void {
     // Discrete and human-rate-bounded → immediate, no throttle.
     this.rawSend({ t: "react", x, y, emoji, seq: this.nextSeq() });
+  }
+
+  sendChat(text: string): void {
+    const trimmed = text.trim().slice(0, 300);
+    if (trimmed.length === 0) return;
+    this.rawSend({ t: "say", text: trimmed, seq: this.nextSeq() });
   }
 
   close(): void {
@@ -382,6 +389,24 @@ export class RoomSession {
         peer.lastSeq = msg.seq; // reactions advance the shared baseline too
         peer.lastSeenAt = performance.now(); // PHASE 6 (FR-11)
         this.emit({ type: "reaction", from: msg.from, x: msg.x, y: msg.y, emoji: msg.emoji, seq: msg.seq });
+        return;
+      }
+      case "chat": {
+        const peer = this.peers.get(msg.from);
+        if (peer !== undefined) {
+          if (msg.seq <= peer.lastSeq) return;
+          peer.lastSeq = msg.seq;
+          peer.lastSeenAt = performance.now();
+        }
+        this.emit({
+          type: "chat",
+          from: msg.from,
+          name: msg.name,
+          color: msg.color,
+          text: msg.text,
+          ts: msg.ts,
+          seq: msg.seq,
+        });
         return;
       }
       case "pong": {

@@ -36,6 +36,7 @@ import {
   type MoveMsg,
   type PeerSnapshot,
   type ReactMsg,
+  type SayMsg,
   type WelcomeMsg,
 } from "./protocol.js";
 import type { WsConnection } from "./ws.js";
@@ -257,8 +258,8 @@ export class RoomManager {
     return { welcome, evictedOld };
   }
 
-  /** Relay a sequenced action (move/react). Rate-limited and stale-dropped silently. */
-  action(conn: WsConnection, msg: MoveMsg | ReactMsg): ActionResult {
+  /** Relay a sequenced action (move/react/say). Rate-limited and stale-dropped silently. */
+  action(conn: WsConnection, msg: MoveMsg | ReactMsg | SayMsg): ActionResult {
     const peer = this.sessions.get(conn);
     if (peer === undefined) return "not_joined";
     peer.lastSeen = Date.now();
@@ -282,9 +283,22 @@ export class RoomManager {
         encodeMessage({ t: "cursor", from: peer.clientId, x: msg.x, y: msg.y, seq: msg.seq, ts: Date.now() }),
         peer.clientId,
       );
-    } else {
+    } else if (msg.t === "react") {
       room.broadcast(
         encodeMessage({ t: "reaction", from: peer.clientId, x: msg.x, y: msg.y, emoji: msg.emoji, seq: msg.seq }),
+        peer.clientId,
+      );
+    } else if (msg.t === "say") {
+      room.broadcast(
+        encodeMessage({
+          t: "chat",
+          from: peer.clientId,
+          name: peer.name,
+          color: peer.color,
+          text: msg.text,
+          seq: msg.seq,
+          ts: Date.now(),
+        }),
         peer.clientId,
       );
     }

@@ -25,6 +25,7 @@ const clientSamples: readonly ClientMessage[] = [
   { t: "move", x: 0.5, y: 0.25, seq: 7 },
   { t: "react", x: 0.9, y: 0.1, emoji: "🔥", seq: 3 },
   { t: "ping", clientTime: 123.456 }, // fractional ms is legal
+  { t: "say", text: "Hello room!", seq: 4 },
 ];
 
 const serverSamples: readonly ServerMessage[] = [
@@ -43,6 +44,7 @@ const serverSamples: readonly ServerMessage[] = [
   { t: "reaction", from: bob, x: 0.9, y: 0.1, emoji: "🎉", seq: 5 },
   { t: "pong", clientTime: 123.456, serverTime: 1_700_000_000_456 },
   { t: "error", code: "malformed", detail: "move.x" },
+  { t: "chat", from: bob, name: "Bob", color: 3, text: "Hey Alice!", ts: 1_700_000_000_200, seq: 15 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -235,6 +237,7 @@ describe("compile-time exhaustiveness guards", () => {
         case "move":
         case "react":
         case "ping":
+        case "say":
           return m.t;
         default:
           return assertNever(m);
@@ -253,6 +256,7 @@ describe("compile-time exhaustiveness guards", () => {
         case "reaction":
         case "pong":
         case "error":
+        case "chat":
           return m.t;
         default:
           return assertNever(m);

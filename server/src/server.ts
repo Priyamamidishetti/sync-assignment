@@ -138,7 +138,8 @@ function route(manager: RoomManager, conn: WsConnection, msg: ClientMessage): vo
       return;
     }
     case "move":
-    case "react": {
+    case "react":
+    case "say": {
       const result = manager.action(conn, msg);
       if (result === "not_joined") {
         sendError(conn, "not_joined", `${msg.t} sent before hello`);

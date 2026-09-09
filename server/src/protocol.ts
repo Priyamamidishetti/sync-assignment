@@ -108,7 +108,13 @@ export interface PingMsg {
   readonly clientTime: number; // performance.now()-style ms, fractional allowed
 }
 
-export type ClientMessage = HelloMsg | MoveMsg | ReactMsg | PingMsg;
+export interface SayMsg {
+  readonly t: "say";
+  readonly text: string;
+  readonly seq: number;
+}
+
+export type ClientMessage = HelloMsg | MoveMsg | ReactMsg | PingMsg | SayMsg;
 
 // ---------------------------------------------------------------------------
 // Server → Client
@@ -182,8 +188,25 @@ export interface ErrorMsg {
   readonly detail: string; // ≤ 200 chars, human-readable
 }
 
+export interface ChatServerMsg {
+  readonly t: "chat";
+  readonly from: ClientId;
+  readonly name: PeerName;
+  readonly color: PeerColorIndex;
+  readonly text: string;
+  readonly ts: number;
+  readonly seq: number;
+}
+
 export type ServerMessage =
-  | WelcomeMsg | JoinMsg | LeaveMsg | CursorMsg | ReactionMsg | PongMsg | ErrorMsg;
+  | WelcomeMsg
+  | JoinMsg
+  | LeaveMsg
+  | CursorMsg
+  | ReactionMsg
+  | PongMsg
+  | ErrorMsg
+  | ChatServerMsg;
 
 // ---------------------------------------------------------------------------
 // Parse results
@@ -312,6 +335,14 @@ const decodePing = (v: Obj): ParseResult<PingMsg> => {
   return { ok: true, message: { t: "ping", clientTime } };
 };
 
+const decodeSay = (v: Obj): ParseResult<SayMsg> => {
+  const text = str(v.text, 1, 300);
+  if (text === null) return malformed("say.text");
+  const seq = uint(v.seq);
+  if (seq === null) return malformed("say.seq");
+  return { ok: true, message: { t: "say", text, seq } };
+};
+
 const decodePeerInfo = (v: unknown, path: string): ParseResult<PeerInfo> => {
   if (!isObj(v)) return malformed(path);
   const clientId = str(v.clientId, 1, 64);
@@ -408,6 +439,22 @@ const decodeError = (v: Obj): ParseResult<ErrorMsg> => {
   return { ok: true, message: { t: "error", code: v.code as ErrorCode, detail } };
 };
 
+const decodeChatServer = (v: Obj): ParseResult<ChatServerMsg> => {
+  const from = str(v.from, 1, 64);
+  if (from === null) return malformed("chat.from");
+  const name = str(v.name, 1, 24);
+  if (name === null) return malformed("chat.name");
+  const color = colorIndex(v.color);
+  if (color === null) return malformed("chat.color");
+  const text = str(v.text, 1, 300);
+  if (text === null) return malformed("chat.text");
+  const seq = uint(v.seq);
+  if (seq === null) return malformed("chat.seq");
+  const ts = nonneg(v.ts);
+  if (ts === null) return malformed("chat.ts");
+  return { ok: true, message: { t: "chat", from, name, color, text, seq, ts } };
+};
+
 // ---------------------------------------------------------------------------
 // Envelope & public API
 // ---------------------------------------------------------------------------
@@ -446,6 +493,7 @@ export function parseClientMessage(raw: string): ParseResult<ClientMessage> {
     case "move":  return decodeMove(env.obj);
     case "react": return decodeReact(env.obj);
     case "ping":  return decodePing(env.obj);
+    case "say":   return decodeSay(env.obj);
     default:
       return { ok: false, code: "unknown_type", detail: `unknown client message t="${env.t}"` };
   }
@@ -466,6 +514,7 @@ export function parseServerMessage(raw: string): ParseResult<ServerMessage> {
     case "reaction": return decodeReaction(env.obj);
     case "pong":     return decodePong(env.obj);
     case "error":    return decodeError(env.obj);
+    case "chat":     return decodeChatServer(env.obj);
     default:
       return { ok: false, code: "unknown_type", detail: `unknown server message t="${env.t}"` };
   }

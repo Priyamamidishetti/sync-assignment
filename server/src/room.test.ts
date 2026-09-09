@@ -425,4 +425,24 @@ describe("rooms, presence & relay", () => {
     expect(close.code).toBe(1008);
     expect(close.reason).toContain("repeated malformed");
   });
+
+  it("chat relay: messages are forwarded to peers with name, color, and ts", async () => {
+    const a = await connect(); await hello(a, "r-chat", "A", "Alice");
+    const b = await connect(); await hello(b, "r-chat", "B", "Bob");
+    b.clearMessages();
+
+    a.send(encodeMessage({ t: "say", text: "Hello everyone!", seq: 1 }));
+    await sleep(50);
+
+    const chats = of(b, "chat");
+    expect(chats.length).toBe(1);
+    expect(chats[0].from).toBe("A");
+    expect(chats[0].name).toBe("Alice");
+    expect(chats[0].text).toBe("Hello everyone!");
+    expect(typeof chats[0].color).toBe("number");
+    expect(typeof chats[0].ts).toBe("number");
+
+    // Sender A was skipped (skip-sender)
+    expect(of(a, "chat").length).toBe(0);
+  });
 });

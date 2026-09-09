@@ -20,6 +20,16 @@ interface UiState {
   rttMs: number | null;
 }
 
+interface ChatMessage {
+  readonly id: string;
+  readonly from: string;
+  readonly name: string;
+  readonly color: number;
+  readonly text: string;
+  readonly ts: number;
+  readonly isSelf: boolean;
+}
+
 const STATE_META: Record<ConnectionState, { color: string; label: string }> = {
   connecting: { color: "#f4a259", label: "connecting" },
   online: { color: "#8ac926", label: "online" },
@@ -47,6 +57,9 @@ const inputStyle: React.CSSProperties = {
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sessionRef = useRef<RoomSession | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
   const roomId = useMemo(
     () => new URLSearchParams(window.location.search).get("room") ?? "lobby",
     [],
@@ -67,6 +80,12 @@ export default function App() {
     rttMs: null,
   });
   const [interpRows, setInterpRows] = useState<InterpDebugEntry[]>([]);
+
+  // Chat state
+  const [chatOpen, setChatOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
 
   const selectEmoji = (e: ReactionEmoji) => {
     emojiRef.current = e;
@@ -90,8 +109,26 @@ export default function App() {
         : undefined,
       onEvent: (event) => {
         if (event.type === "reaction") {
-          // Remote reaction → burst. Local ones already echoed in the renderer.
           renderer?.spawnReaction(event.emoji, event.x, event.y);
+          return;
+        }
+        if (event.type === "chat") {
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: `${event.from}-${event.seq}-${event.ts}`,
+              from: event.from,
+              name: event.name,
+              color: event.color,
+              text: event.text,
+              ts: event.ts,
+              isSelf: false,
+            },
+          ]);
+          setChatOpen((open) => {
+            if (!open) setUnreadCount((c) => c + 1);
+            return open;
+          });
           return;
         }
         setUi((prev) => {
@@ -111,6 +148,7 @@ export default function App() {
       },
     });
 
+    sessionRef.current = session;
     renderer = new CursorCanvas(canvas, session, () => emojiRef.current);
     session.start();
     renderer.start();
@@ -121,6 +159,7 @@ export default function App() {
     }
 
     return () => {
+      sessionRef.current = null;
       if (debugInterval !== null) clearInterval(debugInterval);
       renderer?.stop();
       session.close();
@@ -130,7 +169,7 @@ export default function App() {
   // Number keys 1–8 switch the reaction emoji (never while typing in inputs).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const idx = Number(e.key) - 1;
       if (Number.isInteger(idx) && idx >= 0 && idx < REACTION_EMOJIS.length) {
         selectEmoji(REACTION_EMOJIS[idx]);
@@ -140,11 +179,39 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Auto-scroll chat to latest message
+  useEffect(() => {
+    if (chatOpen) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatMessages, chatOpen]);
+
   const commitName = () => {
     const trimmed = nameDraft.trim().slice(0, 24);
     if (trimmed === (appliedName ?? "")) return;
     saveName(trimmed);
     setAppliedName(trimmed.length > 0 ? trimmed : undefined);
+  };
+
+  const handleSendChat = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const text = chatDraft.trim();
+    if (text.length === 0 || !sessionRef.current) return;
+    sessionRef.current.sendChat(text);
+    // Instant local echo
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        id: `self-${Date.now()}-${Math.random()}`,
+        from: loadClientId(),
+        name: appliedName ?? ui.you?.name ?? "you",
+        color: ui.you?.color ?? 0,
+        text,
+        ts: Date.now(),
+        isSelf: true,
+      },
+    ]);
+    setChatDraft("");
   };
 
   const participants = ui.peers.length + 1;
@@ -202,6 +269,43 @@ export default function App() {
             style={inputStyle}
           />
         </label>
+
+        {/* Chat Drawer Toggle Button */}
+        <button
+          onClick={() => {
+            setChatOpen((open) => !open);
+            if (!chatOpen) setUnreadCount(0);
+          }}
+          style={{
+            background: chatOpen ? "rgba(91,142,230,0.25)" : "rgba(255,255,255,0.08)",
+            border: chatOpen ? "1px solid #5b8ee6" : "1px solid rgba(255,255,255,0.15)",
+            color: "#fff",
+            borderRadius: 6,
+            padding: "3px 10px",
+            fontSize: 12,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <span>💬 Chat</span>
+          {unreadCount > 0 && (
+            <span
+              style={{
+                background: "#e05680",
+                color: "#fff",
+                borderRadius: 999,
+                padding: "1px 6px",
+                fontSize: 10,
+                fontWeight: "bold",
+              }}
+            >
+              {unreadCount}
+            </span>
+          )}
+        </button>
+
         <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginLeft: "auto" }}>
           <span style={{ width: 8, height: 8, borderRadius: 999, background: meta.color, display: "inline-block" }} />
           {meta.label}
@@ -261,6 +365,160 @@ export default function App() {
           );
         })}
       </aside>
+
+      {/* Collapsible Chat Drawer */}
+      {chatOpen && (
+        <div
+          style={{
+            ...chrome,
+            position: "fixed",
+            bottom: 60,
+            right: 12,
+            width: 300,
+            height: 380,
+            display: "flex",
+            flexDirection: "column",
+            zIndex: 20,
+            boxShadow: "0 12px 36px rgba(0,0,0,0.5)",
+            border: "1px solid rgba(255,255,255,0.14)",
+          }}
+        >
+          {/* Drawer Header */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "10px 14px",
+              borderBottom: "1px solid rgba(255,255,255,0.08)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>💬 Room Chat</span>
+              <span style={{ fontSize: 11, opacity: 0.55 }}>#{roomId}</span>
+            </div>
+            <button
+              onClick={() => setChatOpen(false)}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "#aaa",
+                cursor: "pointer",
+                fontSize: 15,
+                lineHeight: 1,
+                padding: 2,
+              }}
+              title="Close chat"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* Messages Body */}
+          <div
+            style={{
+              flex: 1,
+              overflowY: "auto",
+              padding: "10px 12px",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            {chatMessages.length === 0 && (
+              <div style={{ opacity: 0.45, fontSize: 12, textAlign: "center", marginTop: 70 }}>
+                No messages yet.<br />Say hello to the room! 👋
+              </div>
+            )}
+            {chatMessages.map((m) => (
+              <div
+                key={m.id}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: m.isSelf ? "flex-end" : "flex-start",
+                  gap: 2,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, opacity: 0.7 }}>
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: 999,
+                      background: PEER_COLORS[m.color] ?? "#888",
+                      display: "inline-block",
+                    }}
+                  />
+                  <span>{m.isSelf ? "you" : m.name}</span>
+                  <span>·</span>
+                  <span>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                </div>
+                <div
+                  style={{
+                    background: m.isSelf ? "rgba(91,142,230,0.3)" : "rgba(255,255,255,0.07)",
+                    border: m.isSelf ? "1px solid rgba(91,142,230,0.4)" : "1px solid rgba(255,255,255,0.08)",
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    lineHeight: 1.4,
+                    maxWidth: "85%",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {m.text}
+                </div>
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Chat Input Bar */}
+          <form
+            onSubmit={handleSendChat}
+            style={{
+              padding: "8px 10px",
+              borderTop: "1px solid rgba(255,255,255,0.08)",
+              display: "flex",
+              gap: 6,
+            }}
+          >
+            <input
+              value={chatDraft}
+              onChange={(e) => setChatDraft(e.target.value)}
+              placeholder="Type a message..."
+              maxLength={300}
+              style={{
+                flex: 1,
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid rgba(255,255,255,0.15)",
+                color: "#fff",
+                borderRadius: 6,
+                padding: "6px 10px",
+                fontSize: 12,
+                outline: "none",
+              }}
+            />
+            <button
+              type="submit"
+              disabled={chatDraft.trim().length === 0}
+              style={{
+                background: chatDraft.trim().length > 0 ? "#5b8ee6" : "rgba(255,255,255,0.08)",
+                color: chatDraft.trim().length > 0 ? "#fff" : "rgba(255,255,255,0.4)",
+                border: "none",
+                borderRadius: 6,
+                padding: "6px 12px",
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: chatDraft.trim().length > 0 ? "pointer" : "default",
+                transition: "background 0.15s ease",
+              }}
+            >
+              Send
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* Emoji picker: DOM above the canvas — its clicks never spawn reactions. */}
       <div
