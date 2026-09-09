@@ -166,7 +166,23 @@ Backoff 500 ms ×2 → 8 s cap, ±30 % jitter, unlimited attempts, reset on
 welcome. On rejoin, one unthrottled move restores our cursor for others.
 
 ### 3.6 Known debt (by design, per phase plan)
-Reaction rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (→ 6).
+Stale-peer fade (→ Phase 6), malformed escalation (→ Phase 6).
+
+### 3.7 Reaction path (Phase 5)
+
+    tap ──► local echo burst (instant) + sendReact (unthrottled, discrete)
+              │
+              ▼ server: relay to others (skip sender, rate bucket, seq guard)
+              ▼ receivers: shared per-peer lastSeq dedupe (FR-20)
+              ▼ App "reaction" event ──► renderer.spawnReaction()
+              ▼ analytic particles (position = f(now − born)), ttl 1.5 s,
+                capped at 32 live bursts (oldest dropped)
+
+Reactions are deliberately NOT interpolated: they are discrete, unpredictable
+events — buffering them would add latency with no smoothness gain. They
+render on arrival; under throttling that means they land late, which is the
+honest behavior. Own reactions echo locally (the relay never echoes the
+sender), mirroring own-cursor prediction.
 
 ## 4. Failure handling matrix — Phase 6
 (disconnect, reconnect, out-of-order, malformed, oversized, flood)
@@ -205,4 +221,8 @@ Reaction rendering (→ Phase 5), presence list (→ Phase 5), stale-peer fade (
 | 25 | Linear-decay dead reckoning to a full stop | Bounded overshoot (v·cap/2); velocity is exactly 0 at the cap — no jerk at the hold seam | Pure linear extrapolation (unbounded error); exponential decay (harder to test/explain) |
 | 26 | Recovery blend (150 ms) at resume | Prediction error unwinds smoothly instead of snapping back | Snap to truth (visible blip) |
 | 27 | Filter state separated from pure track math | One render consumer; debug polling can't corrupt the blend | Stateful track (polling hazards) |
+| 28 | Own reactions echo locally | Instant feedback; server skip-sender means no round-trip for your own burst | Server echo (adds RTT to your own reaction) |
+| 29 | Analytic particles (pos = f(age)) | No integration drift; canvas-free unit tests | Stepped physics (drift, harder to test) |
+| 30 | Shared per-peer lastSeq for move+react dedupe | One baseline covers the one shared counter; mirrors the server guard (defensive-only under TCP ordering) | Per-type baselines (cross-type drops) |
+| 31 | Burst cap 32, oldest dropped | Bounded render cost under floods (NFR-4) | Unbounded (memory/CPU red flag) |
 

@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { PeerInfo } from "@protocol";
+import { PEER_COLORS, REACTION_EMOJIS, type PeerInfo, type ReactionEmoji } from "@protocol";
 import { CursorCanvas } from "./render";
-import { RoomSession, defaultWsUrl, type ConnectionState, type InterpDebugEntry, type RemotePeer } from "./connection";
+import {
+  RoomSession,
+  defaultWsUrl,
+  type ConnectionState,
+  type InterpDebugEntry,
+  type RemotePeer,
+} from "./connection";
 import { DEFAULT_INTERPOLATION } from "./interpolation";
 import { loadClientId, loadName, saveName } from "./identity";
 
@@ -19,6 +25,15 @@ const STATE_META: Record<ConnectionState, { color: string; label: string }> = {
   reconnecting: { color: "#e05680", label: "reconnecting" },
 };
 
+const chrome: React.CSSProperties = {
+  background: "rgba(18,18,24,0.85)",
+  border: "1px solid rgba(255,255,255,0.08)",
+  borderRadius: 10,
+  color: "#e8e8ee",
+  fontFamily: "system-ui, sans-serif",
+  backdropFilter: "blur(6px)",
+};
+
 const inputStyle: React.CSSProperties = {
   background: "rgba(255,255,255,0.08)",
   border: "1px solid rgba(255,255,255,0.15)",
@@ -29,35 +44,20 @@ const inputStyle: React.CSSProperties = {
   width: 120,
 };
 
-const panelStyle: React.CSSProperties = {
-  position: "fixed",
-  bottom: 12,
-  left: 12,
-  zIndex: 10,
-  fontFamily: "ui-monospace, monospace",
-  fontSize: 11,
-  lineHeight: 1.6,
-  color: "#cfe3cf",
-  background: "rgba(18,18,24,0.85)",
-  border: "1px solid rgba(255,255,255,0.08)",
-  borderRadius: 8,
-  padding: "8px 12px",
-  pointerEvents: "none",
-};
-
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const roomId = useMemo(
     () => new URLSearchParams(window.location.search).get("room") ?? "lobby",
     [],
   );
-  // A/B demo switch: snapping (Phase 3 behavior) vs interpolation (Phase 4).
   const snapMode = useMemo(
     () => new URLSearchParams(window.location.search).get("snap") === "1",
     [],
   );
   const [nameDraft, setNameDraft] = useState(() => loadName() ?? "");
   const [appliedName, setAppliedName] = useState<string | undefined>(() => loadName());
+  const [emoji, setEmoji] = useState<ReactionEmoji>("🔥");
+  const emojiRef = useRef<ReactionEmoji>("🔥"); // read by the renderer without effect churn
   const [ui, setUi] = useState<UiState>({
     state: "connecting",
     attempt: 0,
@@ -67,9 +67,16 @@ export default function App() {
   });
   const [interpRows, setInterpRows] = useState<InterpDebugEntry[]>([]);
 
+  const selectEmoji = (e: ReactionEmoji) => {
+    emojiRef.current = e;
+    setEmoji(e);
+  };
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas === null) return;
+
+    let renderer: CursorCanvas | null = null; // assigned below; events fire only after start()
 
     const session = new RoomSession({
       url: defaultWsUrl(),
@@ -82,7 +89,8 @@ export default function App() {
         : undefined,
       onEvent: (event) => {
         if (event.type === "reaction") {
-          console.log("[live-room] reaction (rendered in Phase 5):", event);
+          // Remote reaction → burst. Local ones already echoed in the renderer.
+          renderer?.spawnReaction(event.emoji, event.x, event.y);
           return;
         }
         setUi((prev) => {
@@ -102,12 +110,10 @@ export default function App() {
       },
     });
 
-    const renderer = new CursorCanvas(canvas, session);
+    renderer = new CursorCanvas(canvas, session, () => emojiRef.current);
     session.start();
     renderer.start();
 
-    // Dev-only interpolation inspector (raw track state; the recovery
-    // filter is never touched by polling).
     let debugInterval: ReturnType<typeof setInterval> | null = null;
     if (import.meta.env.DEV) {
       debugInterval = setInterval(() => setInterpRows(session.interpolationDebug()), 300);
@@ -115,10 +121,23 @@ export default function App() {
 
     return () => {
       if (debugInterval !== null) clearInterval(debugInterval);
-      renderer.stop();
+      renderer?.stop();
       session.close();
     };
   }, [appliedName, roomId, snapMode]);
+
+  // Number keys 1–8 switch the reaction emoji (never while typing in inputs).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement) return;
+      const idx = Number(e.key) - 1;
+      if (Number.isInteger(idx) && idx >= 0 && idx < REACTION_EMOJIS.length) {
+        selectEmoji(REACTION_EMOJIS[idx]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const commitName = () => {
     const trimmed = nameDraft.trim().slice(0, 24);
@@ -141,10 +160,13 @@ export default function App() {
           height: "100vh",
           display: "block",
           cursor: "none",
+          touchAction: "none", // taps react; no scroll/zoom gestures
         }}
       />
+
       <header
         style={{
+          ...chrome,
           position: "fixed",
           top: 0,
           left: 0,
@@ -153,20 +175,15 @@ export default function App() {
           gap: 16,
           alignItems: "center",
           padding: "10px 16px",
-          background: "rgba(18,18,24,0.85)",
-          backdropFilter: "blur(6px)",
           borderBottom: "1px solid rgba(255,255,255,0.08)",
-          fontFamily: "system-ui, sans-serif",
-          color: "#e8e8ee",
+          borderRadius: 0,
           zIndex: 10,
         }}
       >
         <strong style={{ fontSize: 14 }}>live-room</strong>
         <span style={{ fontSize: 12, opacity: 0.7 }}>room: {roomId}</span>
         {snapMode && (
-          <span
-            style={{ fontSize: 11, background: "#5b8ee6", color: "#0d0d12", borderRadius: 6, padding: "2px 8px" }}
-          >
+          <span style={{ fontSize: 11, background: "#5b8ee6", color: "#0d0d12", borderRadius: 6, padding: "2px 8px" }}>
             snap mode (no interpolation)
           </span>
         )}
@@ -197,8 +214,82 @@ export default function App() {
         )}
       </header>
 
+      {/* Presence list (FR-10): color dots + names, live on "peers" events. */}
+      <aside
+        style={{
+          ...chrome,
+          position: "fixed",
+          top: 56,
+          right: 12,
+          padding: "10px 14px",
+          fontSize: 12,
+          zIndex: 10,
+          minWidth: 130,
+        }}
+      >
+        <div style={{ opacity: 0.55, fontSize: 11, marginBottom: 6 }}>participants</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
+          <span style={{ width: 10, height: 10, borderRadius: 999, display: "inline-block", background: ui.you ? PEER_COLORS[ui.you.color] : "#888" }} />
+          <span>{ui.you ? `${ui.you.name} (you)` : "you"}</span>
+        </div>
+        {ui.peers.map((p) => (
+          <div key={p.clientId} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
+            <span style={{ width: 10, height: 10, borderRadius: 999, display: "inline-block", background: PEER_COLORS[p.color] ?? "#888" }} />
+            <span>{p.name}</span>
+          </div>
+        ))}
+      </aside>
+
+      {/* Emoji picker: DOM above the canvas — its clicks never spawn reactions. */}
+      <div
+        style={{
+          ...chrome,
+          position: "fixed",
+          bottom: 12,
+          right: 12,
+          display: "flex",
+          gap: 4,
+          padding: "6px 8px",
+          zIndex: 10,
+        }}
+      >
+        {REACTION_EMOJIS.map((e, i) => (
+          <button
+            key={e}
+            onClick={() => selectEmoji(e)}
+            title={`key ${i + 1}`}
+            style={{
+              width: 36,
+              height: 36,
+              fontSize: 19,
+              lineHeight: 1,
+              cursor: "pointer",
+              borderRadius: 8,
+              border: e === emoji ? "1px solid #5b8ee6" : "1px solid transparent",
+              background: e === emoji ? "rgba(91,142,230,0.25)" : "transparent",
+              transform: e === emoji ? "scale(1.08)" : "none",
+            }}
+          >
+            {e}
+          </button>
+        ))}
+      </div>
+
       {import.meta.env.DEV && (
-        <div style={panelStyle}>
+        <div
+          style={{
+            ...chrome,
+            position: "fixed",
+            bottom: 12,
+            left: 12,
+            fontFamily: "ui-monospace, monospace",
+            fontSize: 11,
+            lineHeight: 1.6,
+            color: "#cfe3cf",
+            padding: "8px 12px",
+            pointerEvents: "none",
+          }}
+        >
           <div style={{ color: "#9fd0ff" }}>
             interp ·{" "}
             {snapMode

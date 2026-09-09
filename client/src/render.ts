@@ -1,21 +1,28 @@
 /**
  * render.ts — canvas rendering + local input capture.
  *
- * Deliberately dumb: every frame it asks the session for positions via
- * peerPosition(). Phase 3 returns the last-known position — remote cursors
- * SNAP between updates, which is known debt, fixed in Phase 4's
- * interpolation engine WITHOUT this file changing (that's the point of the
- * peerPosition seam).
+ * - Remote cursors: positioned via session.peerPosition() — the
+ *   interpolation seam, unchanged since Phase 3 (renderer never knew
+ *   interpolation happened).
+ * - Own cursor: drawn from local input only — zero added latency (FR-29).
+ * - Reactions (Phase 5): pointerDOWN on the canvas emits a reaction at that
+ *   point — locally echoed instantly (the server never echoes the sender),
+ *   same prediction pattern as the own cursor. Remote bursts arrive via
+ *   App → spawnReaction(). Particle logic lives in bursts.ts.
  *
- * Own cursor: drawn from local input only — zero added latency (FR-29).
+ * Input split: pointermove is on window (cursor tracking everywhere);
+ * pointerdown is on the CANVAS element only, so clicks on UI chrome
+ * (header, emoji picker, presence) never spawn reactions.
  */
-import { PEER_COLORS } from "@protocol";
+import { PEER_COLORS, type ReactionEmoji } from "@protocol";
 import type { RemotePeer, RoomSession } from "./connection";
+import { ReactionBursts } from "./bursts";
 
-const FALLBACK_COLOR = "#5b8ee6"; // before welcome (own color unknown)
+const FALLBACK_COLOR = "#5b8ee6";
 
 export class CursorCanvas {
   private readonly ctx: CanvasRenderingContext2D;
+  private readonly bursts = new ReactionBursts();
   private rafId = 0;
   private disposed = false;
   private own = { x: 0.5, y: 0.5 };
@@ -24,13 +31,15 @@ export class CursorCanvas {
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly session: RoomSession,
+    private readonly getEmoji: () => ReactionEmoji = () => "🔥",
   ) {
     const ctx = canvas.getContext("2d");
     if (ctx === null) throw new Error("2D canvas context unavailable");
     this.ctx = ctx;
-    this.onResize(); // must come after ctx is assigned (field-initializer ordering)
+    this.onResize(); // after ctx assignment (field-initializer ordering)
     window.addEventListener("resize", this.onResize);
     window.addEventListener("pointermove", this.onPointerMove);
+    this.canvas.addEventListener("pointerdown", this.onPointerDown);
   }
 
   start(): void {
@@ -42,14 +51,32 @@ export class CursorCanvas {
     cancelAnimationFrame(this.rafId);
     window.removeEventListener("resize", this.onResize);
     window.removeEventListener("pointermove", this.onPointerMove);
+    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
   }
 
-  // -- local input: own cursor is local-only (FR-29) --------------------------------
+  /** Remote reaction landed — spawn its burst. Called by App on the event. */
+  spawnReaction(emoji: string, x: number, y: number): void {
+    this.bursts.spawn(emoji, x, y);
+  }
+
+  // -- local input ---------------------------------------------------------------
 
   private onPointerMove = (e: PointerEvent): void => {
     this.own = { x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight };
     this.ownVisible = true;
     this.session.sendMove(this.own.x, this.own.y);
+  };
+
+  private onPointerDown = (e: PointerEvent): void => {
+    const x = e.clientX / window.innerWidth;
+    const y = e.clientY / window.innerHeight;
+    this.own = { x, y };
+    this.ownVisible = true;
+    const emoji = this.getEmoji();
+    // Local echo: the relay skips the sender, so we render our own burst
+    // immediately — prediction, exactly like the own cursor.
+    this.bursts.spawn(emoji, x, y);
+    this.session.sendReact(x, y, emoji); // discrete: immediate, never throttled
   };
 
   private onResize = (): void => {
@@ -59,7 +86,7 @@ export class CursorCanvas {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   };
 
-  // -- render loop ----------------------------------------------------------------------
+  // -- render loop -----------------------------------------------------------------
 
   private loop = (): void => {
     if (this.disposed) return;
@@ -73,7 +100,7 @@ export class CursorCanvas {
     this.ctx.clearRect(0, 0, w, h);
 
     for (const peer of this.session.peerList()) {
-      const pos = this.session.peerPosition(peer); // ← Phase 4 swaps the implementation
+      const pos = this.session.peerPosition(peer); // the seam — unchanged
       if (pos === null) continue; // joined but never moved
       this.drawCursor(pos.x * w, pos.y * h, PEER_COLORS[peer.color] ?? FALLBACK_COLOR, peer.name);
     }
@@ -84,6 +111,9 @@ export class CursorCanvas {
       const label = you !== null ? `${you.name} (you)` : "you";
       this.drawCursor(this.own.x * w, this.own.y * h, color, label);
     }
+
+    // Reactions paint on top of cursors.
+    this.bursts.draw(this.ctx, w, h, performance.now());
   }
 
   private drawCursor(x: number, y: number, color: string, label: string): void {

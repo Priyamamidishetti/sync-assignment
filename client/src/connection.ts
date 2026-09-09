@@ -1,12 +1,14 @@
 /**
  * connection.ts — the client sync engine: native WebSocket transport,
- * identity, throttling, reconnect, inbound validation, peer store, and
- * (Phase 4) the interpolation engine wired in behind the peerPosition()
- * seam. Framework-agnostic: React never touches a socket; the renderer
- * reads state only through the public API below.
+ * identity, throttling, reconnect, inbound validation, peer store, the
+ * interpolation engine (Phase 4), and reaction dedupe (Phase 5).
+ * Framework-agnostic: React never touches a socket; the renderer reads
+ * state only through the public API below.
  *
  *  - Own cursor: local prediction, zero added latency (FR-29).
  *  - Moves: ≤30 Hz, leading + trailing, trailing guaranteed (FR-13).
+ *  - Reactions: immediate, never throttled (human tap rate is bounded);
+ *    deduped inbound against the shared per-peer seq baseline (FR-20).
  *  - seq: ONE monotonic counter shared by move/react, NEVER reset while the
  *    page lives. Receivers recreate peer entries on join/leave ("identity
  *    epochs"), resetting their per-peer baselines — so a reloaded sender
@@ -20,8 +22,10 @@
  *  - Inbound: everything goes through parseServerMessage; malformed input
  *    is counted and dropped, never crashes (FR-32).
  *  - PHASE 4: remote positions come from the InterpolationEngine; the
- *    welcome snapshot seeds it; join/leave reset its tracks (identity
- *    epochs apply to interpolation state too).
+ *    welcome snapshot seeds it; join/leave reset its tracks.
+ *  - PHASE 5: reactions emit a RoomEvent for the UI to render; a shared
+ *    per-peer lastSeq (moves AND reactions) dedupes inbound actions —
+ *    defensive-only within one TCP connection, mirroring the server guard.
  */
 import {
   encodeMessage,
@@ -35,7 +39,7 @@ import {
 } from "@protocol";
 import { LeadingTrailingThrottle } from "./throttle";
 import { backoffDelay } from "./backoff";
-import { InterpolationEngine, type InterpolationConfig } from "./interpolation"; // PHASE 4
+import { InterpolationEngine, type InterpolationConfig } from "./interpolation";
 
 export type ConnectionState = "connecting" | "online" | "reconnecting";
 
@@ -51,6 +55,8 @@ export interface RemotePeer {
   name: string;
   color: number;
   cursor: RemoteCursor | null;
+  /** PHASE 5: shared seq baseline for ALL inbound actions (move + react). */
+  lastSeq: number;
 }
 
 export type RoomEvent =
@@ -78,7 +84,6 @@ export interface RoomSessionOptions {
   readonly moveHz?: number;
   readonly pingIntervalMs?: number;
   readonly debugRateLog?: boolean;
-  /** PHASE 4: interpolation overrides (e.g. ?snap=1 → all-zero = snapping). */
   readonly interpolation?: Partial<InterpolationConfig>;
   readonly onEvent: (event: RoomEvent) => void;
 }
@@ -92,7 +97,7 @@ export class RoomSession {
   private readonly moveThrottle: LeadingTrailingThrottle<{ x: number; y: number }>;
   private readonly moveHz: number;
   private readonly pingIntervalMs: number;
-  private readonly interp: InterpolationEngine; // PHASE 4
+  private readonly interp: InterpolationEngine;
 
   private ws: WebSocket | null = null;
   private stopped = false;
@@ -115,7 +120,7 @@ export class RoomSession {
   constructor(private readonly opts: RoomSessionOptions) {
     this.moveHz = opts.moveHz ?? 30;
     this.pingIntervalMs = opts.pingIntervalMs ?? 5_000;
-    this.interp = new InterpolationEngine(opts.interpolation); // PHASE 4
+    this.interp = new InterpolationEngine(opts.interpolation);
     this.moveThrottle = new LeadingTrailingThrottle<{ x: number; y: number }>(
       1000 / this.moveHz,
       (v) => {
@@ -156,15 +161,14 @@ export class RoomSession {
   }
 
   /**
-   * THE RENDERING SEAM. Phase 4: the interpolation engine's filtered output
-   * at (now − renderDelay). render.ts still calls exactly this method —
-   * it was never changed when the engine landed.
+   * THE RENDERING SEAM. Interpolated position at (now − renderDelay).
+   * render.ts calls exactly this — unchanged since Phase 3.
    */
   peerPosition(peer: RemotePeer): { x: number; y: number } | null {
     return this.interp.positionNow(peer.clientId);
   }
 
-  /** PHASE 4: raw per-peer interpolation state for the dev panel. */
+  /** Raw per-peer interpolation state for the dev panel. */
   interpolationDebug(): InterpDebugEntry[] {
     return this.interp.debugSnapshot().map((entry) => {
       const peer = this.peers.get(entry.peerId);
@@ -187,6 +191,7 @@ export class RoomSession {
   }
 
   sendReact(x: number, y: number, emoji: ReactionEmoji): void {
+    // Discrete and human-rate-bounded → immediate, no throttle.
     this.rawSend({ t: "react", x, y, emoji, seq: this.nextSeq() });
   }
 
@@ -203,7 +208,7 @@ export class RoomSession {
       this.devTimer = null;
     }
     if (this.ws !== null) {
-      this.ws.onclose = null;
+      this.ws.onclose = null; // deliberate close — don't treat as a drop
       this.ws.close();
       this.ws = null;
     }
@@ -277,20 +282,28 @@ export class RoomSession {
         // Snapshot is authoritative: rebuild the peer map AND the
         // interpolation state (identity-epoch reset for our whole view).
         this.peers.clear();
-        this.interp.clear(); // PHASE 4
+        this.interp.clear();
         const now = performance.now();
         for (const snap of msg.peers) {
+          const hasCursor =
+            snap.x !== undefined && snap.y !== undefined && snap.seq !== undefined;
           this.peers.set(snap.clientId, {
             clientId: snap.clientId,
             name: snap.name,
             color: snap.color,
-            cursor:
-              snap.x !== undefined && snap.y !== undefined && snap.seq !== undefined
-                ? { x: snap.x, y: snap.y, seq: snap.seq, at: now }
-                : null,
+            cursor: hasCursor
+              ? { x: snap.x as number, y: snap.y as number, seq: snap.seq as number, at: now }
+              : null,
+            lastSeq: hasCursor ? (snap.seq as number) : -1, // PHASE 5
           });
-          if (snap.x !== undefined && snap.y !== undefined && snap.seq !== undefined) {
-            this.interp.feed(snap.clientId, snap.x, snap.y, snap.seq, now); // PHASE 4: seed
+          if (hasCursor) {
+            this.interp.feed(
+              snap.clientId,
+              snap.x as number,
+              snap.y as number,
+              snap.seq as number,
+              now,
+            );
           }
         }
         this.attempt = 0;
@@ -318,14 +331,15 @@ export class RoomSession {
           name: msg.name,
           color: msg.color,
           cursor: null,
+          lastSeq: -1, // PHASE 5: fresh entry = fresh baseline (identity epoch)
         });
-        this.interp.remove(msg.clientId); // PHASE 4: fresh track = fresh epoch
+        this.interp.remove(msg.clientId);
         this.emit({ type: "peers" });
         return;
       }
       case "leave": {
         if (this.peers.delete(msg.clientId)) {
-          this.interp.remove(msg.clientId); // PHASE 4
+          this.interp.remove(msg.clientId);
           this.emit({ type: "peers" });
         }
         return;
@@ -333,13 +347,20 @@ export class RoomSession {
       case "cursor": {
         const peer = this.peers.get(msg.from);
         if (peer === undefined) return; // unknown peer (race) — ignore
-        if (peer.cursor !== null && msg.seq <= peer.cursor.seq) return; // stale/dup, FR-14
+        if (msg.seq <= peer.lastSeq) return; // stale/dup — SHARED baseline (FR-14)
+        peer.lastSeq = msg.seq; // PHASE 5
         peer.cursor = { x: msg.x, y: msg.y, seq: msg.seq, at: performance.now() };
-        this.interp.feed(msg.from, msg.x, msg.y, msg.seq, performance.now()); // PHASE 4
+        this.interp.feed(msg.from, msg.x, msg.y, msg.seq, performance.now());
         this.emit({ type: "peers" });
         return;
       }
       case "reaction": {
+        // PHASE 5: dedupe against the same shared baseline as moves, then
+        // hand the event to the UI for rendering (no state to keep).
+        const peer = this.peers.get(msg.from);
+        if (peer === undefined) return; // unknown peer — ignore
+        if (msg.seq <= peer.lastSeq) return; // stale/dup (FR-20)
+        peer.lastSeq = msg.seq; // reactions advance the shared baseline too
         this.emit({ type: "reaction", from: msg.from, x: msg.x, y: msg.y, emoji: msg.emoji, seq: msg.seq });
         return;
       }

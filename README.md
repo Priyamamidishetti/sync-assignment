@@ -8,8 +8,17 @@ No Socket.IO / Yjs / PartyKit / any sync library.
 - ✅ Phase 1: hand-rolled RFC 6455 WebSocket server
 - ✅ Phase 2: rooms, presence, relay, heartbeat, replace-on-reconnect
 - ✅ Phase 3: client sync core (transport, throttle, reconnect, canvas)
-- ✅ Phase 4: interpolation — remote cursors are smooth under degraded networks
-- ⏳ Phase 5: reaction bursts + presence list — next
+- ✅ Phase 4: interpolation — smooth cursors under degraded networks
+- ✅ Phase 5: reactions (tap-to-react bursts), emoji picker, presence list
+- ⏳ Phase 6: hardening (stale-peer fade, malformed escalation) — next
+
+## Using the demo
+- Click/tap anywhere → reaction burst at that point (everyone sees it).
+- Number keys 1–8 or the bottom-right picker switch the emoji.
+- The right panel lists participants; the header shows connection state,
+  participant count, and RTT.
+- Reactions are NOT interpolated (discrete events render on arrival —
+  under network throttling they land late, by design).
 
 ## Demo: see the interpolation working
 - Open two tabs. In dev builds, a bottom-left panel shows per-peer buffer
@@ -33,13 +42,12 @@ Single port (built):
     cd server && npm run dev
     open http://localhost:8080 in several tabs
 
-Client unit tests (throttle, backoff, interpolation):  cd client && npm test
-Server unit tests (ws, protocol, room):               cd server && npm test
+Client unit tests (throttle, backoff, interpolation, bursts):  cd client && npm test
+Server unit tests (ws, protocol, room):                        cd server && npm test
 
-## Phase 4 known debt (per phase plan)
-- Reactions are console-logged, not rendered — Phase 5
-- Presence is a count, not a list — Phase 5
+## Phase 5 known debt (per phase plan)
 - Stale-peer fade (FR-11) — Phase 6
+- Repeated-malformed escalation (disconnect after 5 violations/10s) — Phase 6
 
 ## Setup (current state)
 Server tests:
